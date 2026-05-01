@@ -19,7 +19,7 @@ recompute — replacing the uniform-weight placeholder in the kelle-simulator de
 | 1 | `scripts/01_collect_traces.py` — forward pass SmolLM-135M, save `(layers, heads, seq, seq)` attention tensors | **Implemented** |
 | 2 | `scripts/02_extract_features.py` — extract 12-feature per-token table → `data/features/features.parquet` | **Implemented** |
 | 3 | `scripts/03_generate_labels.py` — AERP binary labels → `data/features/labels.parquet` | **Implemented** |
-| 4 | `tip-train` (XGBoost) — rank features, select top-K | Planned |
+| 4 | `scripts/04_train_xgb.py` — XGBoost feature ranking → `data/models/xgb_selector.json` + `selected_features.json` | **Implemented** |
 | 5 | `tip-train` (MLP) — train `input → 32 → 16 → 1 sigmoid` on pruned feature set | Planned |
 | 6 | `tip-eval` — evaluate predictor against kelle-simulator AERP baseline | Planned |
 
