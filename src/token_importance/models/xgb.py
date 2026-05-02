@@ -26,11 +26,14 @@ from sklearn.metrics import accuracy_score, average_precision_score, f1_score, r
 from xgboost import XGBClassifier
 
 
+JOIN_KEYS = ["sample_id", "token_pos", "layer", "head"]
+
+
 def load_dataset(features_path: Path, labels_path: Path) -> pd.DataFrame:
-    """Join feature and label Parquet files on (sample_id, token_pos)."""
+    """Join feature and label Parquet files on (sample_id, token_pos, layer, head)."""
     features = pd.read_parquet(features_path)
-    labels = pd.read_parquet(labels_path)[["sample_id", "token_pos", "label"]]
-    merged = features.merge(labels, on=["sample_id", "token_pos"], how="inner")
+    labels = pd.read_parquet(labels_path)[[*JOIN_KEYS, "label"]]
+    merged = features.merge(labels, on=JOIN_KEYS, how="inner")
     if len(merged) != len(features):
         logging.warning(
             "Join dropped %d rows — features and labels may be out of sync",
