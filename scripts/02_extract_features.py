@@ -26,10 +26,10 @@ def parse_args() -> argparse.Namespace:
         "--output-path", type=Path, default=Path("data/features/features.parquet")
     )
     p.add_argument(
-        "--window-size",
+        "--recent-window",
         type=int,
         default=8,
-        help="Number of recent queries included in the rolling-window attention feature.",
+        help="Threshold for is_recent: 1 if pos_from_end < recent_window, else 0.",
     )
     p.add_argument(
         "--max-samples",
@@ -58,7 +58,7 @@ def main() -> None:
     table = build_feature_table(
         trace_dir=args.trace_dir,
         output_path=args.output_path,
-        window=args.window_size,
+        recent_window=args.recent_window,
         max_samples=args.max_samples,
     )
 
