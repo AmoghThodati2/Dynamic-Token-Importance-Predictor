@@ -1,14 +1,17 @@
 """
 scripts/03_generate_labels.py
 
-Generate per-token AERP binary labels from attention traces and write
-data/features/labels.parquet.
+Generate per-(layer, head, token_pos) above-mean binary labels from attention traces
+and write data/features/labels.parquet.
 
-Each row aligns with a row in data/features/features.parquet on (sample_id, token_pos).
-Join the two files to get the full (X, y) dataset for XGBoost / MLP training.
+Each row in the output is uniquely keyed by (sample_id, token_pos, layer, head) and
+aligns row-for-row with features.parquet produced by 02_extract_features.py.
 
-Label rule: token k is labeled 1 if ≥ vote_threshold fraction of (layer, head) pairs
-rank it among the top --cache-size tokens by cumulative attention received.
+Label rule: label = 1 if attn[l, h, T-1, k] > mean(attn[l, h, T-1, :]) else 0 — i.e.,
+'did this head's last-query attention to this token exceed the head's mean over all
+keys?'. This is the per-head increment condition used by the simulator's
+systolic_evictor.accumulate_scores. See src/token_importance/labels.py for full
+discussion.
 """
 
 from __future__ import annotations
@@ -21,27 +24,11 @@ from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Generate AERP token-importance labels from attention traces."
+        description="Generate per-(layer, head, token) above-mean labels."
     )
     p.add_argument("--trace-dir", type=Path, default=Path("data/traces"))
     p.add_argument(
         "--output-path", type=Path, default=Path("data/features/labels.parquet")
-    )
-    p.add_argument(
-        "--cache-size",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "KV cache capacity: tokens each head retains (default: seq_len // 2). "
-            "Use 128 to match the kelle-simulator reference setting when seq_len > 128."
-        ),
-    )
-    p.add_argument(
-        "--vote-threshold",
-        type=float,
-        default=0.5,
-        help="Minimum fraction of (layer, head) pairs voting to retain for label=1.",
     )
     p.add_argument(
         "--max-samples",
@@ -72,21 +59,19 @@ def main() -> None:
     table = build_label_table(
         trace_dir=args.trace_dir,
         output_path=args.output_path,
-        cache_size=args.cache_size,
-        vote_threshold=args.vote_threshold,
         max_samples=args.max_samples,
     )
 
     print(f"\n{len(table):,} rows — label distribution:")
     print(table["label"].value_counts().to_string())
-    print("\nvote_frac stats:")
-    print(table["vote_frac"].describe().to_string())
+    print(f"\npositive rate: {table['label'].mean():.4f}")
 
-    # Show the joined shape as a quick sanity check
     feat_path = args.trace_dir.parent / "features" / "features.parquet"
     if feat_path.exists():
         features = pd.read_parquet(feat_path)
-        joined = features.merge(table, on=["sample_id", "token_pos"], how="inner")
+        joined = features.merge(
+            table, on=["sample_id", "token_pos", "layer", "head"], how="inner"
+        )
         print(f"\nJoined with feature table: {len(joined):,} rows × {len(joined.columns)} cols")
         if len(joined) != len(table):
             print(

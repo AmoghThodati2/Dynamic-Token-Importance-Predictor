@@ -1,22 +1,22 @@
 """
-Generate binary token-importance labels matching kelle-simulator's AERP definition.
+Generate per-(layer, head, token) labels matching the simulator's per-head increment
+condition in `systolic_evictor.accumulate_scores`.
 
-For each (layer, head) pair, tokens are ranked by cumulative attention received
-(sum of attention column over all query positions). A head "votes to retain" token k
-if k is among the top-cache_size tokens by that metric. A token is labeled 1 (important)
-if ≥vote_threshold fraction of all (layer, head) pairs vote to retain it — mirroring the
-≥50% head-vote rule in kelle-simulator's AERP eviction policy.
+For each (layer, head, token_pos) the label is:
 
-Default cache_size = seq_len // 2, which yields approximately balanced classes and
-matches the intuition that roughly half of a sequence's tokens are worth retaining.
-At the reference simulator cache size of N=128, use --cache-size 128 when seq_len > 128.
+    label = 1 if attn[l, h, T-1, k] > mean(attn[l, h, T-1, :]) else 0
 
-Output columns:
-    sample_id   — from the source trace
-    token_pos   — key position in [0, seq_len)
-    label       — 1 if retained by ≥50% of heads, else 0
-    n_votes     — raw vote count (number of (layer, head) pairs that retained this token)
-    vote_frac   — n_votes / (num_layers × num_heads)
+This is the per-head decision underlying the AERP retention rule
+(`head_counts / num_heads_total >= 0.5`): each head increments `head_counts[k]` whenever
+the weight to token k exceeds the mean weight across all keys for that head's call. By
+training the predictor against this exact per-head signal, the model learns to produce
+distributions whose above-mean set matches the heuristic's above-mean set.
+
+Output: one row per (sample_id, token_pos, layer, head) with columns:
+    sample_id, token_pos, layer, head, label
+
+Joinable on those four keys to features.parquet (per-head schema). The label table
+always has the same row count as the feature table for the same trace set.
 """
 
 from __future__ import annotations
@@ -24,61 +24,40 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 
 from token_importance.trace import iter_traces
 
 
-def compute_labels(
-    attn: torch.Tensor,
-    sample_id: int,
-    cache_size: int | None = None,
-    vote_threshold: float = 0.5,
-) -> pd.DataFrame:
+def compute_labels(attn: torch.Tensor, sample_id: int) -> pd.DataFrame:
     """
-    Compute per-token AERP labels for one sample.
+    Per-(layer, head, token_pos) above-mean labels for one sample.
 
-    attn:           (L, H, T, T) fp16 — attn[l, h, q, k] is weight query q gives to key k.
-    cache_size:     tokens each head retains (default: T // 2). Clamped to [1, T].
-    vote_threshold: minimum fraction of heads that must vote to retain for label=1.
+    attn: (L, H, T, T) fp16 — attn[l, h, q, k] is weight query q gives to key k.
+    Returns DataFrame with T*L*H rows ordered by (layer, head, token_pos), matching
+    extract_features() row order so the two tables align without re-sorting.
     """
     n_layers, n_heads, seq_len, _ = attn.shape
     a = attn.float()
 
-    k = cache_size if cache_size is not None else max(seq_len // 2, 1)
-    k = max(1, min(k, seq_len))
+    last_attn_lh = a[:, :, -1, :]                            # (L, H, T)
+    last_mean = last_attn_lh.mean(dim=2, keepdim=True)       # (L, H, 1)
+    label_lhk = (last_attn_lh > last_mean).to(torch.int8)    # (L, H, T)
 
-    if k == seq_len:
-        logging.warning(
-            "sample %05d: cache_size (%d) >= seq_len (%d) — all tokens labeled positive",
-            sample_id,
-            k,
-            seq_len,
-        )
-
-    # Cumulative attention received by each token per (layer, head)
-    col_sums = a.sum(dim=2)  # (L, H, T): sum over query dim
-
-    # For each (layer, head), identify the top-k tokens by cumulative attention
-    _, top_idx = col_sums.topk(k, dim=2)  # (L, H, k)
-
-    # Scatter-count: how many (layer, head) pairs retained each token
-    votes = torch.zeros(seq_len, dtype=torch.float32)
-    flat_idx = top_idx.reshape(-1)  # (L * H * k,)
-    votes.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.float32))
-
-    n_total = n_layers * n_heads
-    vote_frac = votes / n_total
-    labels = (vote_frac >= vote_threshold).to(torch.int8)
+    lh = n_layers * n_heads
+    layer_arr = torch.arange(n_layers, dtype=torch.int32).repeat_interleave(n_heads * seq_len)
+    head_arr = torch.arange(n_heads, dtype=torch.int32).repeat_interleave(seq_len).repeat(n_layers)
+    token_pos_arr = torch.arange(seq_len, dtype=torch.int32).repeat(lh)
 
     return pd.DataFrame(
         {
-            "sample_id": sample_id,
-            "token_pos": torch.arange(seq_len).numpy(),
-            "label": labels.numpy(),
-            "n_votes": votes.to(torch.int32).numpy(),
-            "vote_frac": vote_frac.numpy(),
+            "sample_id": np.full(lh * seq_len, sample_id, dtype=np.int32),
+            "token_pos": token_pos_arr.numpy(),
+            "layer": layer_arr.numpy(),
+            "head": head_arr.numpy(),
+            "label": label_lhk.reshape(-1).numpy(),
         }
     )
 
@@ -86,15 +65,11 @@ def compute_labels(
 def build_label_table(
     trace_dir: Path,
     output_path: Path,
-    cache_size: int | None = None,
-    vote_threshold: float = 0.5,
     max_samples: int | None = None,
 ) -> pd.DataFrame:
     """
-    Generate labels for all traces in trace_dir and write a Parquet file at output_path.
-
-    Processes one trace at a time. The output can be joined to the feature table from
-    features.py on (sample_id, token_pos) for downstream XGBoost / MLP training.
+    Generate per-(layer, head, token_pos) above-mean labels for all traces in
+    trace_dir and write a Parquet file at output_path.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     frames: list[pd.DataFrame] = []
@@ -103,12 +78,10 @@ def build_label_table(
         if max_samples is not None and i >= max_samples:
             break
         try:
-            df = compute_labels(
-                attn, sid, cache_size=cache_size, vote_threshold=vote_threshold
-            )
+            df = compute_labels(attn, sid)
             frames.append(df)
             logging.debug(
-                "sample %05d: %d tokens, %.1f%% positive",
+                "sample %05d: %d rows, %.1f%% positive",
                 sid,
                 len(df),
                 100.0 * df["label"].mean(),
@@ -124,12 +97,10 @@ def build_label_table(
 
     table = pd.concat(frames, ignore_index=True)
     table.to_parquet(output_path, index=False)
-
-    pos_rate = table["label"].mean()
     logging.info(
         "Label table: %d rows, %.1f%% positive → %s",
         len(table),
-        100.0 * pos_rate,
+        100.0 * table["label"].mean(),
         output_path,
     )
     return table
